@@ -60,16 +60,21 @@ function App() {
 
     if (urlId) {
       setMode('download');
-      
+
       const collection = room.collection(FILE_LINKS_COLLECTION).filter({ custom_id: urlId });
       
-      const unsubscribe = collection.subscribe(records => {
-        if (collection.getIsLoading()) {
-            setDownloadStatus('Searching for your file...');
-            return;
+      const timeoutId = setTimeout(() => {
+        // If after a short delay there are still no records, assume the file is not found.
+        // This helps prevent showing "not found" prematurely on a slow connection.
+        const currentRecords = collection.getList();
+        if (currentRecords.length === 0) {
+             setDownloadStatus(`File not found. The link may be incorrect or expired.`);
         }
+      }, 2500); // 2.5 second timeout for initial load
 
+      const unsubscribe = collection.subscribe(records => {
         if (records.length > 0) {
+          clearTimeout(timeoutId); // File found, cancel the "not found" timer
           const record = records[0];
           setDownloadStatus(`Downloading "${record.filename}"...`);
           
@@ -82,14 +87,11 @@ function App() {
           document.body.removeChild(link);
           
           unsubscribe(); // Download triggered, no need to listen anymore
-        } else {
-            // If done loading and no records found
-            setDownloadStatus(`File not found. The link may be incorrect or expired.`);
-            unsubscribe();
         }
       });
         
       return () => {
+        clearTimeout(timeoutId);
         unsubscribe();
       };
 
@@ -125,19 +127,11 @@ function App() {
 
     try {
       // 1. Final check for ID uniqueness to prevent race conditions
-      // We use subscribe and wait for loading to finish for the most accurate check.
-      const collection = room.collection(FILE_LINKS_COLLECTION).filter({ custom_id: customId });
-      await new Promise((resolve, reject) => {
-          const unsubscribe = collection.subscribe(records => {
-              if (collection.getIsLoading()) return;
-              unsubscribe();
-              if (records.length > 0) {
-                  reject(new Error('This custom ID was just taken. Please choose another.'));
-              } else {
-                  resolve();
-              }
-          });
-      });
+      // We check the current list directly.
+      const existingRecords = room.collection(FILE_LINKS_COLLECTION).filter({ custom_id: customId }).getList();
+      if (existingRecords.length > 0) {
+        throw new Error('This custom ID was just taken. Please choose another.');
+      }
 
       // 2. Upload file
       const fileUrl = await websim.upload(file);
