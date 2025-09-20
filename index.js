@@ -1,4 +1,4 @@
-const { useState, useEffect, useCallback } = React;
+const { useState, useEffect, useMemo } = React;
 
 // Initialize the WebsimSocket connection at the global scope
 const room = new WebsimSocket();
@@ -11,9 +11,48 @@ function App() {
   // State for upload form
   const [file, setFile] = useState(null);
   const [customId, setCustomId] = useState('');
+  const [idStatus, setIdStatus] = useState(''); // '', 'checking', 'taken', 'available'
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [successLink, setSuccessLink] = useState('');
+
+  // Real-time ID validation
+  useEffect(() => {
+    if (!customId) {
+      setIdStatus('');
+      return;
+    }
+
+    setIdStatus('checking');
+    
+    const handler = setTimeout(() => {
+      const collection = room.collection(FILE_LINKS_COLLECTION).filter({ custom_id: customId });
+      
+      const unsubscribe = collection.subscribe(records => {
+        if (collection.getIsLoading()) {
+          // Still loading, wait for final result
+          return;
+        }
+        if (records.length > 0) {
+          setIdStatus('taken');
+        } else {
+          setIdStatus('available');
+        }
+        // Once we have a definitive answer, we can unsubscribe to avoid unnecessary updates.
+        // The final check will happen on submit anyway.
+        unsubscribe();
+      });
+
+      // Cleanup on next effect run or unmount
+      return () => {
+        clearTimeout(handler);
+        unsubscribe();
+      };
+    }, 500); // Debounce for 500ms
+
+    // Cleanup for the timeout if customId changes quickly
+    return () => clearTimeout(handler);
+  }, [customId]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -22,33 +61,35 @@ function App() {
     if (urlId) {
       setMode('download');
       
-      const unsubscribe = room.collection(FILE_LINKS_COLLECTION)
-        .filter({ custom_id: urlId })
-        .subscribe(records => {
-          if (records.length > 0) {
-            const record = records[0];
-            setDownloadStatus(`Downloading "${record.filename}"...`);
-            
-            // Trigger download
-            const link = document.createElement('a');
-            link.href = record.file_url;
-            link.setAttribute('download', record.filename || 'download.zip');
-            document.body.appendChild(link);
-            link.click();
-            document.body.removeChild(link);
-            
-            unsubscribe();
-          }
-        });
-        
-        // Timeout to handle case where file is not found
-        const timer = setTimeout(() => {
-            setDownloadStatus(`File not found. The link may have expired or is incorrect.`);
-            unsubscribe();
-        }, 5000);
+      const collection = room.collection(FILE_LINKS_COLLECTION).filter({ custom_id: urlId });
+      
+      const unsubscribe = collection.subscribe(records => {
+        if (collection.getIsLoading()) {
+            setDownloadStatus('Searching for your file...');
+            return;
+        }
 
+        if (records.length > 0) {
+          const record = records[0];
+          setDownloadStatus(`Downloading "${record.filename}"...`);
+          
+          // Trigger download
+          const link = document.createElement('a');
+          link.href = record.file_url;
+          link.setAttribute('download', record.filename || 'download.zip');
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+          
+          unsubscribe(); // Download triggered, no need to listen anymore
+        } else {
+            // If done loading and no records found
+            setDownloadStatus(`File not found. The link may be incorrect or expired.`);
+            unsubscribe();
+        }
+      });
+        
       return () => {
-        clearTimeout(timer);
         unsubscribe();
       };
 
@@ -76,18 +117,27 @@ function App() {
   }
 
   const handleSubmit = async () => {
-    if (!file || !customId) return;
+    if (!file || !customId || idStatus !== 'available') return;
 
     setLoading(true);
     setError('');
     setSuccessLink('');
 
     try {
-      // 1. Check for ID uniqueness
-      const existingRecords = room.collection(FILE_LINKS_COLLECTION).filter({ custom_id: customId }).getList();
-      if (existingRecords.length > 0) {
-        throw new Error('This custom ID is already taken. Please choose another.');
-      }
+      // 1. Final check for ID uniqueness to prevent race conditions
+      // We use subscribe and wait for loading to finish for the most accurate check.
+      const collection = room.collection(FILE_LINKS_COLLECTION).filter({ custom_id: customId });
+      await new Promise((resolve, reject) => {
+          const unsubscribe = collection.subscribe(records => {
+              if (collection.getIsLoading()) return;
+              unsubscribe();
+              if (records.length > 0) {
+                  reject(new Error('This custom ID was just taken. Please choose another.'));
+              } else {
+                  resolve();
+              }
+          });
+      });
 
       // 2. Upload file
       const fileUrl = await websim.upload(file);
@@ -104,9 +154,13 @@ function App() {
       setSuccessLink(link);
       setFile(null);
       setCustomId('');
+      setIdStatus('');
 
     } catch (err) {
       setError(err.message || 'An unexpected error occurred.');
+      if (err.message.includes('taken')) {
+          setIdStatus('taken');
+      }
     } finally {
       setLoading(false);
     }
@@ -117,6 +171,16 @@ function App() {
         alert('Link copied to clipboard!');
     });
   }
+
+  const IdStatusIndicator = () => {
+    if (!customId) return null;
+    switch (idStatus) {
+        case 'checking': return <span style={{ color: '#888', fontSize: '0.9em' }}>Checking availability...</span>;
+        case 'available': return <span style={{ color: 'green', fontSize: '0.9em' }}>✔ Available</span>;
+        case 'taken': return <span style={{ color: 'red', fontSize: '0.9em' }}>✖ Taken. Try another.</span>;
+        default: return null;
+    }
+  };
 
   if (mode === 'loading') {
     return <div className="container"><div className="loader">Initializing...</div></div>;
@@ -152,7 +216,8 @@ function App() {
                 onChange={handleCustomIdChange}
                 disabled={loading}
             />
-            <button onClick={handleSubmit} disabled={!file || !customId || loading}>
+            <IdStatusIndicator />
+            <button onClick={handleSubmit} disabled={!file || !customId || loading || idStatus !== 'available'}>
                 {loading ? 'Generating...' : 'Generate Link'}
             </button>
         </div>
@@ -172,4 +237,3 @@ function App() {
 
 const root = ReactDOM.createRoot(document.getElementById('root'));
 root.render(<App />);
-
